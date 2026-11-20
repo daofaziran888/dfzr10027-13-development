@@ -48,6 +48,7 @@
             >
               {{ action }}
             </button>
+            <button class="link" type="button" :data-testid="`run-${row.id}`" @click="openRun(row)">执行预测</button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -55,6 +56,88 @@
         </tr>
       </tbody>
     </table>
+
+    <section class="run-panel" data-testid="run-panel">
+      <h3>训练快照</h3>
+      <p class="page-desc">每次预测按缺口结果确定训练样本日期并落快照：历史训练明细保留当时的数据，两次训练输入可分别核对。</p>
+      <table class="data-table">
+        <thead>
+          <tr><th>run_id</th><th>方案编号</th><th>训练窗口</th><th>实测天数</th><th>估计天数</th><th>缺日列表</th><th>生成时间</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="run in runs" :key="run.run_id" :data-testid="`run-row-${run.run_id}`">
+            <td>{{ run.run_id }}</td>
+            <td>{{ run['方案编号'] ?? '—' }}</td>
+            <td>{{ run['训练窗口']['起始'] }} 至 {{ run['训练窗口']['截止'] }}</td>
+            <td>{{ run['实测天数'] }}</td>
+            <td>{{ run['估计天数'] }}</td>
+            <td>{{ run['缺日列表'].length ? run['缺日列表'].join('、') : '无' }}</td>
+            <td>{{ run['生成时间'] }}</td>
+            <td><button class="link" type="button" :data-testid="`view-${run.run_id}`" @click="selectedRun = run">查看样本</button></td>
+          </tr>
+          <tr v-if="!runs.length">
+            <td colspan="8" class="empty-state">暂无训练快照，可先在方案行上执行预测</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div v-if="selectedRun" class="run-detail" data-testid="run-detail">
+        <h4>{{ selectedRun.run_id }} 训练明细</h4>
+        <p class="decision">窗口决策：{{ selectedRun['窗口决策'] }}</p>
+        <table class="data-table">
+          <thead>
+            <tr><th>业务日期</th><th>取值</th><th>来源</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in selectedRun['训练样本']" :key="s['业务日期']" :data-source="s['来源']">
+              <td>{{ s['业务日期'] }}</td>
+              <td>{{ s['值'] }}</td>
+              <td>{{ s['来源'] }}</td>
+              <td>{{ s['来源'] === '估计' ? s['估计方法'] : s['观测来源'] }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <h4>预测结果（{{ selectedRun['预测结果']['model'] }}）</h4>
+        <table class="data-table">
+          <thead>
+            <tr><th>预测日期</th><th>预测值</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="(d, i) in selectedRun['预测结果']['forecast_dates']" :key="d">
+              <td>{{ d }}</td>
+              <td>{{ selectedRun['预测结果']['predictions'][i] }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <div v-if="runTarget" class="modal-backdrop" data-testid="run-modal">
+      <form class="modal" @submit.prevent="submitRun">
+        <h3>执行预测 · {{ runTarget['方案编号'] }}</h3>
+        <label class="create-field">
+          <span>窗口起始</span>
+          <input v-model="runForm.start" data-testid="run-start" placeholder="2026-08-21" required />
+        </label>
+        <label class="create-field">
+          <span>窗口截止</span>
+          <input v-model="runForm.end" data-testid="run-end" placeholder="2026-08-30" required />
+        </label>
+        <label class="create-field">
+          <span>缺口策略</span>
+          <select v-model="runForm.strategy" data-testid="run-strategy">
+            <option value="估计保留">估计保留（保留早期周期，缺日估计）</option>
+            <option value="截断末段">截断末段（末段连续实测足够时优先减少估计误差）</option>
+          </select>
+        </label>
+        <div class="page-actions">
+          <button class="btn" type="button" @click="runTarget = null">取消</button>
+          <button class="btn primary" data-testid="run-submit" type="submit" :disabled="running">
+            {{ running ? '执行中…' : '确认执行' }}
+          </button>
+        </div>
+      </form>
+    </div>
 
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
@@ -86,6 +169,29 @@ import { request } from '@/api/client'
 
 type Row = Record<string, string | number | null>
 
+interface TrainingSample {
+  业务日期: string
+  值: number
+  来源: string
+  观测来源?: string
+  估计方法?: string
+}
+
+interface ForecastRun {
+  run_id: string
+  方案编号: string | null
+  预测指标: string
+  预测算法: string
+  训练窗口: { 起始: string; 截止: string }
+  实测天数: number
+  估计天数: number
+  缺日列表: string[]
+  窗口决策: string
+  训练样本: TrainingSample[]
+  预测结果: { model: string; predictions: number[]; forecast_dates: string[] }
+  生成时间: string
+}
+
 const ENDPOINT = '/api/forecast'
 const columns = ["方案编号", "预测指标", "预测算法", "训练窗口", "预测周期", "置信水平", "特征列表", "模型版本"]
 const actions = ["启动训练", "发布模型", "废弃方案"]
@@ -105,6 +211,12 @@ const stats = computed(() => [
   { label: metricNames[1], value: rows.value.filter((row) => row.status === statuses[1]).length },
   { label: metricNames[2], value: rows.value.filter((row) => row.status === statuses[statuses.length - 1]).length },
 ])
+
+const runTarget = ref<Row | null>(null)
+const runForm = ref({ start: '2026-08-21', end: '2026-08-30', strategy: '估计保留' })
+const running = ref(false)
+const runs = ref<ForecastRun[]>([])
+const selectedRun = ref<ForecastRun | null>(null)
 
 function resetFilters() {
   filters.value = {}
@@ -168,6 +280,43 @@ async function runAction(action: string, row: Row) {
   }
 }
 
+function openRun(row: Row) {
+  runTarget.value = row
+  errorMessage.value = ''
+}
+
+async function submitRun() {
+  if (!runTarget.value) return
+  running.value = true
+  errorMessage.value = ''
+  try {
+    const response = await request(`${ENDPOINT}/${runTarget.value.id}/run`, {
+      method: 'POST',
+      body: JSON.stringify({ 窗口起始: runForm.value.start, 窗口截止: runForm.value.end, 缺口策略: runForm.value.strategy }),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) throw new Error(payload.message || '预测执行失败')
+    runTarget.value = null
+    selectedRun.value = payload.entry as ForecastRun
+    await loadRuns()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '预测执行失败'
+  } finally {
+    running.value = false
+  }
+}
+
+async function loadRuns() {
+  try {
+    const response = await request(`${ENDPOINT}/runs`)
+    if (!response.ok) return
+    const payload = await response.json()
+    runs.value = (payload.items ?? []) as ForecastRun[]
+  } catch {
+    // 快照列表读取失败不阻断页面
+  }
+}
+
 async function reload() {
   errorMessage.value = ''
   const query = new URLSearchParams(filters.value as Record<string, string>).toString()
@@ -184,5 +333,17 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  void reload()
+  void loadRuns()
+})
 </script>
+
+<style scoped>
+.run-panel { margin-top: 16px; background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.run-panel h3 { margin: 0 0 4px; }
+.run-panel h4 { margin: 16px 0 8px; }
+.run-detail { margin-top: 12px; }
+.decision { font-size: 12px; color: var(--muted); }
+tr[data-source='估计'] td { background: #fffaeb; }
+</style>

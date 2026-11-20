@@ -92,6 +92,47 @@ TREND_POINTS: list[dict] = [
 ]
 
 # ---------------------------------------------------------------------------
+# 2b. 时序观测采集状态——TREN-GMV 在 2026-08-24 漏采，等待补数
+# ---------------------------------------------------------------------------
+# 按序列编号登记“已确认但未采集”的业务日期；观测库播种时会跳过这些日期，
+# 缺口校验与缺口感知预测都基于这份采集状态，而不是直接读 TREND_POINTS。
+MISSING_COLLECTION_DAYS: dict[str, list[str]] = {
+    "TREN-GMV": ["2026-08-24"],
+}
+
+
+def build_trend_observations(series_rows: list[dict]) -> list[dict]:
+    """按序列配置与采集状态生成已确认观测，同一营业日只保留一条真实观测。"""
+    observations: list[dict] = []
+    for series in series_rows:
+        series_code = str(series.get("序列编号", ""))
+        start = str(series.get("起始时间", "") or "")
+        end = str(series.get("截止时间", "") or "")
+        missing = set(MISSING_COLLECTION_DAYS.get(series_code, []))
+        for point in TREND_POINTS:
+            day = str(point["日期"])
+            if start and day < start:
+                continue
+            if end and day > end:
+                continue
+            if day in missing:
+                continue
+            observations.append({
+                "序列编号": series_code,
+                "业务日期": day,
+                "gmv": point["gmv"],
+                "uv": point["uv"],
+                "paid_uv": point["paid_uv"],
+                "total_uv": point["total_uv"],
+                "来源": "采集",
+                "确认状态": "已确认",
+                "版本": 1,
+                "登记时间": f"{day}T02:00:00",
+            })
+    return observations
+
+
+# ---------------------------------------------------------------------------
 # 3. 维度注册（dim_registry）——真实维度层级
 # ---------------------------------------------------------------------------
 DIMENSIONS: list[dict] = [

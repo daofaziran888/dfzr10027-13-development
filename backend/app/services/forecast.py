@@ -1,8 +1,10 @@
 """预测分析业务规则：状态流转、字段校验与筛选口径都收在这里。"""
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
+from app.services import forecast_engine
 from app.store import store
 
 MODULE = "forecast"
@@ -63,3 +65,44 @@ class ForecastService:
         entry["pending"] = target != STATUS_ORDER[-1]
         entry["abnormal"] = action in NEGATIVE_ACTIONS
         return entry, f"预测方案已{action}"
+
+    def run_gap_aware(
+        self,
+        entry_id: int,
+        *,
+        window_start: str | None = None,
+        window_end: str | None = None,
+        strategy: str = "估计保留",
+    ) -> tuple[dict[str, Any] | None, str]:
+        """按缺口结果执行预测：训练样本日期、实测与估计来源、所用范围都随快照保留。"""
+        entry = store.find(MODULE, entry_id)
+        if entry is None:
+            return None, f"预测方案 {entry_id} 不存在或已归档"
+
+        def _parse(raw: str | None, field: str):
+            if not raw:
+                return None, None
+            try:
+                return datetime.strptime(raw.strip(), "%Y-%m-%d").date(), None
+            except ValueError:
+                return None, f"{field}「{raw}」不是 YYYY-MM-DD 格式的业务日期"
+
+        start, err = _parse(window_start, "窗口起始")
+        if err:
+            return None, err
+        end, err = _parse(window_end, "窗口截止")
+        if err:
+            return None, err
+
+        record, message = forecast_engine.run_gap_aware_forecast(
+            metric_code=str(entry.get("预测指标", "")),
+            window_start=start,
+            window_end=end,
+            strategy=strategy,
+            scheme=entry,
+            trigger=f"预测方案 {entry.get('方案编号')} 手工执行",
+        )
+        if record is None:
+            return None, message
+        entry["最近运行"] = record["run_id"]
+        return record, message

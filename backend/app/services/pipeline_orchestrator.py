@@ -6,8 +6,7 @@
 from __future__ import annotations
 
 import math
-import statistics
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Any
 
 from app.fixtures import (
@@ -20,6 +19,7 @@ from app.fixtures import (
     QUALITY_CHECK_SAMPLES,
     TREND_POINTS,
 )
+from app.services import forecast_engine
 from app.store import store
 
 # ---------------------------------------------------------------------------
@@ -123,41 +123,42 @@ def run_metric_agg_pipeline(metric_code: str | None = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def run_forecast_pipeline(horizon: int = 7) -> dict[str, Any]:
-    """基于 fixtures 时序数据做线性趋势外推，生成预测结果供报表消费。"""
-    points = list(TREND_POINTS)
-    n = len(points)
-    if n < 2:
-        return {"error": " insufficient data"}
+    """缺口感知预测管道：按缺口结果确定训练样本，产物供报表消费。
 
-    # 简单线性回归：x = 0..n-1, y = gmv
-    xs = list(range(n))
-    ys = [p["gmv"] for p in points]
-    x_mean = statistics.mean(xs)
-    y_mean = statistics.mean(ys)
-    num = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
-    den = sum((x - x_mean) ** 2 for x in xs)
-    slope = num / den if den else 0.0
-    intercept = y_mean - slope * x_mean
+    报表里的预测数字直接受训练样本来源影响：缺日被估计而非填实测零，
+    所用训练窗口与窗口决策随结果记录，可由 run_id 回溯当时的训练明细。
+    """
+    run, message = forecast_engine.run_gap_aware_forecast(
+        metric_code="METR-GMV",
+        horizon=horizon,
+        trigger="forecast_report 管道",
+    )
+    if run is None:
+        return {"error": message}
 
-    last_date = datetime.strptime(points[-1]["日期"], "%Y-%m-%d").date()
+    algo = run["预测结果"]
     forecasts: list[dict] = []
-    for i in range(1, horizon + 1):
-        pred = slope * (n - 1 + i) + intercept
-        pred_date = last_date + timedelta(days=i)
+    for pred_date, pred in zip(algo["forecast_dates"], algo["predictions"]):
         forecasts.append({
-            "日期": pred_date.isoformat(),
-            "预测gmv": round(pred, 2),
+            "日期": pred_date,
+            "预测gmv": pred,
             "置信下界": round(pred * 0.92, 2),
             "置信上界": round(pred * 1.08, 2),
         })
 
     result = {
-        "model": "linear_trend",
+        "model": algo["model"],
         "horizon": horizon,
-        "slope": round(slope, 4),
-        "intercept": round(intercept, 2),
-        "last_actual": points[-1]["gmv"],
+        "slope": algo.get("slope"),
+        "intercept": algo.get("intercept"),
+        "last_actual": algo["last_actual"],
         "forecasts": forecasts,
+        "run_id": run["run_id"],
+        "训练窗口": run["训练窗口"],
+        "实测天数": run["实测天数"],
+        "估计天数": run["估计天数"],
+        "缺日列表": run["缺日列表"],
+        "窗口决策": run["窗口决策"],
     }
 
     _write_result("forecast_report", {

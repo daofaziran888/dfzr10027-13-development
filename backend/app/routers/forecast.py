@@ -1,4 +1,7 @@
-"""预测分析接口：维护预测方案，覆盖启动训练、发布模型、废弃方案等动作。"""
+"""预测分析接口：维护预测方案，覆盖启动训练、发布模型、废弃方案等动作。
+
+缺口感知预测：按缺口结果确定训练样本日期，训练快照可独立核对。
+"""
 from __future__ import annotations
 
 import csv
@@ -8,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.services import forecast_engine
 from app.services.forecast import ForecastService
 
 router = APIRouter(prefix="/api/forecast", tags=["预测分析"])
@@ -65,6 +69,25 @@ def export_entries(
         headers={"Content-Disposition": 'attachment; filename="forecast.csv"'})
 
 
+@router.get("/runs", response_model=dict)
+def list_runs(
+    方案编号: str | None = Query(default=None, description="按方案编号过滤训练快照"),
+    预测指标: str | None = Query(default=None, description="按预测指标过滤训练快照"),
+) -> dict:
+    """列出预测训练快照：历史预测的训练明细保留当时的数据，两次训练输入可分别核对。"""
+    items = forecast_engine.list_forecast_runs(scheme_code=方案编号, metric_code=预测指标)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/runs/{run_id}", response_model=dict)
+def get_run(run_id: str) -> dict:
+    """读取单次训练快照，含训练样本、实测与估计来源与所用训练窗口。"""
+    record = forecast_engine.get_forecast_run(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"训练快照 {run_id} 不存在")
+    return record
+
+
 @router.get("/{entry_id}", response_model=dict)
 def get_entry(entry_id: int) -> dict:
     """读取单条预测方案明细；不存在时给出可读的错误说明。"""
@@ -90,3 +113,17 @@ def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
+
+
+@router.post("/{entry_id}/run", response_model=ActionResult)
+def run_forecast(entry_id: int, payload: dict[str, object]) -> ActionResult:
+    """缺口感知执行预测：按缺口结果确定训练样本日期，快照记录实测与估计来源及所用范围。"""
+    record, message = service.run_gap_aware(
+        entry_id,
+        window_start=str(payload.get("窗口起始") or "") or None,
+        window_end=str(payload.get("窗口截止") or "") or None,
+        strategy=str(payload.get("缺口策略") or "估计保留"),
+    )
+    if record is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=record)

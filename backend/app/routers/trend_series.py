@@ -1,4 +1,7 @@
-"""时序分析接口：维护时序序列，覆盖初始化序列、标记完整、标记缺口等动作。"""
+"""时序分析接口：维护时序序列，覆盖初始化序列、标记完整、标记缺口等动作。
+
+缺口能力：按业务日期校验指标时序数据（时序缺口数据集）、补数登记与观测核对。
+"""
 from __future__ import annotations
 
 import csv
@@ -8,11 +11,13 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.services.trend_gap import TrendGapService
 from app.services.trend_series import TrendSeriesService
 
 router = APIRouter(prefix="/api/trend_series", tags=["时序分析"])
 
 service = TrendSeriesService()
+gap_service = TrendGapService()
 
 LIST_FIELDS = ["序列编号", "观测指标", "时间粒度", "起始时间", "截止时间", "填充策略", "异常检测", "序列版本"]
 STATUSES = ["待初始化", "采集中", "完整", "有缺口"]
@@ -63,6 +68,63 @@ def export_entries(
     return StreamingResponse(
         iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="trend_series.csv"'})
+
+
+@router.post("/gaps/check", response_model=ActionResult)
+def check_gaps(payload: dict[str, object]) -> ActionResult:
+    """按指定业务日期范围校验缺日；一次查询只确认该范围内的缺日，结果写入时序缺口数据集。"""
+    record, message = gap_service.check_gaps(
+        str(payload.get("序列编号", "") or ""),
+        payload.get("起始日期"),
+        payload.get("截止日期"),
+    )
+    if record is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=record)
+
+
+@router.get("/gaps", response_model=dict)
+def list_gap_checks(
+    序列编号: str | None = Query(default=None, description="按序列编号过滤时序缺口数据集"),
+) -> dict:
+    """查询时序缺口数据集：补数前后的校验记录都保留，可逐条核对观测。"""
+    items = gap_service.list_gap_checks(序列编号)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/gaps/{check_id}", response_model=dict)
+def get_gap_check(check_id: int) -> dict:
+    """读取单条缺口校验记录，用于补数前后对比。"""
+    record = gap_service.get_gap_check(check_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"缺口校验记录 {check_id} 不存在")
+    return record
+
+
+@router.post("/gaps/backfill", response_model=ActionResult)
+def backfill_observation(payload: dict[str, object]) -> ActionResult:
+    """补数登记：缺日不能被填成实测零；同一营业日重传后仍只有一条被确认的真实观测。"""
+    result, message = gap_service.backfill_observation(
+        str(payload.get("序列编号", "") or ""),
+        payload.get("业务日期"),
+        payload,
+    )
+    if result is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=result)
+
+
+@router.get("/observations", response_model=dict)
+def list_observations(
+    序列编号: str = Query(..., description="序列编号，如 TREN-GMV"),
+    起始日期: str = Query(..., description="业务日期起，YYYY-MM-DD"),
+    截止日期: str = Query(..., description="业务日期止，YYYY-MM-DD"),
+) -> dict:
+    """列出指定范围内的已确认观测，补数前后都能逐日核对。"""
+    items, message = gap_service.list_observations(序列编号, 起始日期, 截止日期)
+    if items is None:
+        raise HTTPException(status_code=404, detail=message)
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/{entry_id}", response_model=dict)
